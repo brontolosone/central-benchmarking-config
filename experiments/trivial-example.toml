@@ -1,0 +1,80 @@
+# The stem of this filename (this filename sans extension), together with its parent directory, identify the experiment.
+# (This example experiment definition lives one level up from the real experiment files, though!)
+# The directory is the experiment name, and the stem of this file's filename is the variant of the experiment.
+# Together with the machine name, they and up as PostgreSQL ltree value: `experiment.variant.machine`.
+# Thus each of those names need to be valid ltree labels with characters from [a-zA-Z0-9_-] .
+
+[meta]
+machines = ["waw.v0.c1.m512", "waw.v0.c4.m2048"]   # Machines to execute on. You just have to know which ones exist!
+timeout = 300  # In seconds. Abort if we don't finish within this time. There's an externally defined max timeout as well.
+
+# Optionally, but recommended: Throttle the /dev/disk/by-label/disk device.
+# See https://github.com/qemu/qemu/blob/v10.2.2/docs/throttle.txt for how this works.
+# TLDR: For each of "iops", "bps" there are"_wr" (write) and "_rd" (read) variants.
+# And for each of those six, there are burst dials: "_max" and "_max_length" (interval for the leaky bucket algorithm, in seconds).
+# Thus 12 possible keys in total. Rules:
+# — when "_wr" or "_rd" variants are specified, the combined setting (i.e. "iops", "bps") may not be
+# — when a "_max_length" is specified, its ascendant "_max" also needs to be.
+# — when a "_max" is specified, its ascendant also needs to be.
+# Example: "bps_rd_max_length" needs a "bps_rd_max", which needs a "bps_rd", which precludes "bps" from being specified.
+# It is a good idea to always throttle, so that the VM's I/O characteristics for the disk are (more) constant between tests;
+# unthrottled I/O is more sensitive to activity from the noisy neighbour (the host).
+# Besides, the frugal VPSes on which we want to be able to run, generally have poor I/O performance.
+iothrottle = {bps_rd=30_000_000, bps_wr=10_000_000, iops_rd=300, iops_wr=100} 
+
+# setup section: anything you need to do to initialize the machine.
+# trackedservice section: define servers of which metrics will be tracked (eg, postgres, and a backend server)
+# testload section: run the test load (eg, generate HTTP requests)
+#
+# The setup, trackedservice and testload items all define commands to run.
+# These items have the following structure:
+# name: Will appear in logs and, for [[trackedservice]] items, in metrics as an ltree label.
+#   So keep these short and within [a-zA-Z0-9_-].
+# cmd: Has the following properties:
+#   - exec
+#   - workdir
+#   - uid
+#   - gid
+#   - env (array of key-value pairs)
+#   Only the "exec" property is required.
+#     If an array, it'll be executed without involving a shell.
+#     If a string, it'll be executed as a script — use multiline text and a shebang to make a script.
+#
+# In addition, the testload items can have parsers defined on their stdout and stderr for generating
+# metrics.
+
+[[setup]]
+name = "npm-install"
+cmd.exec = ["npm", "--registry", "http://127.0.0.1:8765", "ci"]  # There is a caching registry at http://127.0.0.1:8765 . Use it :-)
+cmd.workdir = "/code"  # The code at the targeted commit is checked out into /code.
+
+[[setup]]
+# Another example: fetch some test data. Here it's a test submission. It could also be a DB dump.
+# There is no network connectivity for the VM, save for the NPM registry caching proxy used above, and
+# a HTTP proxy at http://127.0.0.1:8888 which allows access to github.com . 
+name = "fetch-test-submission"
+cmd.exec = ["curl", "--silent", "--show-error", "--proxy", "http://127.0.0.1:8888", "--proxytunnel", "--output", "/root/geo-11fields.xml", "https://gist.github.com/brontolosone/4576c5b6ef4ea71b6bee6f5140cef589/raw/564cf0ef78695e89756612496327c7b45021b4af/geo-11fields.xml"]
+
+
+[[trackedservice]]
+# Just-enough-HTTP. Also demonstrates some TOML shell-in-string handling.
+name = "socat"
+cmd.exec = ["/usr/bin/socat", "TCP-LISTEN:8383,fork,reuseaddr", """SYSTEM:"echo 'HTTP/1.0 200'; echo 'Content-Type: text/plain'; echo; echo doei" """]
+
+[[testload]]
+# Testload items are executed in-order. Their output can be parsed into metrics if a parser is specified.
+# Without a parser specified, only timing info (start and stop times, and for convenience, total time taken) are turned into metrics.
+# Currently we only have the hey-summary-v1 parser, which records metrics with t=finish time.
+# (There is in fact a "csv" output for hey, but it's a bit harsh in terms of data volume, we're
+# usually not interested in per-individual-request metrics if performing 1000s of them).
+# The parser is configured through stdout.parser and stderr.parser. But it is optional.
+name = "hey"  # Will be part of the metric key, so keep it short and in [a-zA-Z0-9-].
+cmd.exec = [
+    "/usr/bin/hey",
+    "-c", "1",
+    "-n", "100",
+    "-m", "GET",
+    "-t", "0",
+    "http://127.0.0.1:8383",
+]
+stdout.parser = "hey-summary-v1"

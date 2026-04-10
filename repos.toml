@@ -1,0 +1,18 @@
+# This file defines repos to sync with.
+#    - The name is a moniker, it will show up in graphs etc. Please make it as short as possible.
+#      Valid chars are [a-zA-Z0-9_-].
+#    - The "url" field should contain the URL for the repo.
+#      Currently only public access repos are supported.
+#      Supporting private repos is not fundamentally impossible but (in its simplest form) is going to
+#      require management of deploy keys, so… to be implemented when a real need arises.
+#    - The "paused" boolean field (false by default) can be used to stop syncing a certain repo.
+#
+# Remove a repo from here, and... anything exclusively to do with that repo will be garbagecollected
+# from the filesystem and database.
+
+[repos.odk]  # The "odk" key here is the repo moniker. Keep repo monikers short. See note above.
+url = "https://github.com/getodk/central-backend.git"  # See note on public access above.
+paused = false  # = the default.
+
+[repos.bronto]
+url = "http://github.com/brontolosone/central-backend.git"

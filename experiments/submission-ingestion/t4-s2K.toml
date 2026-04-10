@@ -1,0 +1,136 @@
+
+# Description:
+# Spam submissions, with 4 http client threads, and the submission is less than 2KB of XML (11 fields).
+# Server is one node process (no pm2 involved).
+# Measurements produced: longitudinal node + postgres, and hey.
+
+[meta]
+machines = ["waw.v0.c1.m512", "waw.v0.c4.m2048"]
+timeout = 300
+iothrottle = {bps_rd=30_000_000, bps_wr=10_000_000, iops_rd=300, iops_wr=100} 
+
+
+[[setup]]
+name = "npm-install"
+cmd.workdir = "/code"
+cmd.exec = ["npm", "--registry", "http://127.0.0.1:8765", "ci"]
+
+[[setup]]
+name = "prepdb"
+cmd.workdir = "/code"
+cmd.env = [
+    { "PGDATABASE" = "odkcentral" },
+    { "PGHOST" = "127.0.0.1" },  # We could use the local Unix socket, but then we wouldn't see the amount of DB traffic (shows up as IP traffic).
+    { "PGUSER" = "root" },
+]
+cmd.exec = """
+#!/bin/bash -eux
+ODKCURL='curl --fail --silent --show-error -H "Accept: application/json, text/plain, */*" -H "Authorization: Bearer 0123456789012345678901234567890123456789012345678901234567890123"'
+MOUNTPOINT=/var/lib/postgresql
+PGDATA=${MOUNTPOINT}/18/data
+PGSUDO="systemd-run --quiet --slice-inherit --uid=postgres --gid=postgres --setenv PGDATA=${PGDATA} --setenv DATA_DIR=${PGDATA}"
+
+# create Postgres' datadir & database
+mount /dev/disk/by-label/disk ${MOUNTPOINT}
+mkdir -p -m 0755 ${PGDATA}
+chown postgres:postgres ${PGDATA}
+
+${PGSUDO} --wait -- initdb18 --auth-local=trust --encoding=UTF8 --no-locale --locale-provider=builtin --no-data-checksums --username=root --set wal_level=minimal --set max_wal_senders=0 --set listen_addresses=127.0.0.1
+${PGSUDO} --wait -- postgresql-18-check-db-dir
+${PGSUDO} --unit=postgresql-prepping.service --property=Type=notify -- /usr/lib64/postgresql-18/bin/postgres
+pg_isready18
+createdb18 -O root odkcentral
+
+# initialize DB, central-wise
+node lib/bin/run-migrations.js
+echo nopenopenope | node lib/bin/cli.js -u x@example.com user-create
+node lib/bin/cli.js -u x@example.com user-promote
+
+# create an "API token"
+/usr/lib64/postgresql-18/bin/psql << ANDTHATSTHEEND
+
+    INSERT INTO sessions ("actorId", token, "expiresAt", "createdAt", csrf)
+    VALUES (
+            (SELECT "actorId" FROM users WHERE email = 'x@example.com'),
+            '0123456789012345678901234567890123456789012345678901234567890123',
+            'Infinity',
+            now(),
+            'thecsrftoken'
+    )
+
+ANDTHATSTHEEND
+
+# start central, wait for it to be reachable
+systemd-run --working-directory=/code --unit=node-central-prepping.service --quiet --slice-inherit --setenv PGDATABASE=${PGDATABASE} --setenv PGUSER=${PGUSER} -- /usr/bin/node lib/bin/run-server.js
+while ! (fuser 8383/tcp); do sleep 1; done
+
+# create project & form
+eval "${ODKCURL} --json '{\\"name\\": \\"Das Experiment\\"}' http://127.0.0.1:8383/v1/projects"
+curl --fail --follow --silent --show-error --proxy http://127.0.0.1:8888 --proxytunnel https://gist.githubusercontent.com/brontolosone/360c89e5e48e7fd0a31e4a1612680f3a/raw/f6e264ee3102ca5c5d21a103222628182a2005dd/geotest.xml | eval "${ODKCURL} -X POST --data-binary @- -H 'Content-Type: application/xml' 'http://127.0.0.1:8383/v1/projects/1/forms?publish=true'"
+
+# cleanup
+systemctl stop node-central-prepping.service
+systemctl stop postgresql-prepping.service
+"""
+
+[[setup]]
+name = "fetch-test-submission"
+cmd.exec = ["curl", "--fail", "--follow", "--remove-on-error", "--silent", "--show-error", "--proxy", "http://127.0.0.1:8888", "--proxytunnel", "--output", "/root/geo-11fields.xml", "https://gist.githubusercontent.com/brontolosone/170b542a241026ef8c31bd5c660b6112/raw/012665cd530ba55d7589c8fc2b202b49675289fe/geo-11fields.xml"]
+
+
+[[trackedservice]]
+name = "postgres"
+cmd.exec = ["/usr/lib64/postgresql-18/bin/postgres"]
+cmd.uid = "postgres"
+cmd.gid = "postgres"
+cmd.env = [
+    { "PGDATA" = "/var/lib/postgresql/18/data" },
+]
+
+[[trackedservice]]
+name = "nodejs"
+cmd.exec = ["/usr/bin/node", 'lib/bin/run-server.js']
+cmd.workdir = "/code"
+cmd.env = [
+    { "PGDATABASE" = "odkcentral" },
+    { "PGHOST" = "127.0.0.1" },  # We could use the local Unix socket, but then we wouldn't see the amount of DB traffic in our metrics (shows up as IP traffic).
+    { "PGUSER" = "root" },
+]
+
+
+[[testload]]
+# We don't want to start hey until the HTTP server has created a listening socket.
+name = "wait-for-http"
+cmd.exec = """
+#!/usr/bin/bash -eux
+while ! (fuser 8383/tcp); do sleep 1; done
+"""
+
+[[testload]]
+name = "hey"
+cmd.exec = [
+    "/usr/bin/hey",
+    "-c", "4",
+    "-n", "10000",
+    "-m", "POST" ,
+    "-t", "0",
+    "-D", "/root/geo-11fields.xml",
+    "-T", "application/xml",
+    "-H", "Authorization: Bearer 0123456789012345678901234567890123456789012345678901234567890123",
+    "http://127.0.0.1:8383/v1/projects/1/forms/geotest/submissions",
+]
+stdout.parser = "hey-summary-v1"
+
+[[testload]]
+name = "drain-backlog"  # Make sure all the work in background queues is done. It's part of the job.
+cmd.exec = """
+#!/bin/bash -eux
+while [[ "t" = $(/usr/lib64/postgresql-18/bin/psql --tuples-only -c "select exists(select 1 from audits where processed IS NULL AND failures = 0)" --quiet --no-password --no-align odkcentral) ]]; do
+    sleep 1
+done
+"""
+cmd.env = [
+    { "PGDATABASE" = "odkcentral" },
+    { "PGHOST" = "127.0.0.1" },  # We could use the local Unix socket, but then we wouldn't see the amount of DB traffic in our metrics (shows up as IP traffic).
+    { "PGUSER" = "root" },
+]
