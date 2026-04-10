@@ -1,0 +1,31 @@
+name: Config file schema checks
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+  workflow_dispatch:
+
+jobs:
+  check-schema:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load UV cache
+        uses: actions/cache@v5.0.4
+        with:
+          path: /root/.cache/uv
+          key: uvcache
+      - name: Install UV
+        run: sudo snap install astral-uv --classic
+      - name: Check repos.toml
+        run: BB_GIT_REPO_PREFIXES_ALLOWED="https://github.com/" uv tool run --from https://github.com/brontolosone/central-benchmarking.git bb-validate validate-repoconf "${GITHUB_WORKSPACE}"/repos.toml
+      - name: Check each experiment config
+        run: for expconf in "${GITHUB_WORKSPACE}"/experiments/*/*.toml; do BB_GIT_REPO_PREFIXES_ALLOWED="https://github.com/" uv tool run --from https://github.com/brontolosone/central-benchmarking.git bb-validate validate-expconf "${expconf}"; done
+      - name: Save UV cache
+        uses: actions/cache@v5.0.4
+        with:
+          path: /root/.cache/uv
+          key: uvcache
